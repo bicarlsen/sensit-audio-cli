@@ -1,57 +1,184 @@
+//! # References
+//! + https://github.com/dceddia/ffmpeg-cpal-play-audio
+//! + https://www.bekk.christmas/post/2023/19/make-some-noise-with-rust
+mod input_actor;
+mod player_actor;
+
 use cpal::traits::*;
+use crossbeam::{channel, select};
 use ffmpeg_next as ffm;
 use sensit_audio_cli as lib;
-use std::{fs, io, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 const AUDIO_BUFFER_SIZE: usize = 8192;
+const CMD_KEY_PREVIOUS: &str = "j";
+const CMD_KEY_NEXT: &str = "k";
+const CMD_KEY_TOGGLE_PLAY: &str = "p";
 
 pub fn main() {
     log::enable();
     ffm::init().expect("could not initialize ffmpeg");
     let (output_device, stream_config) = init_cpal();
-    let mut player = lib::AudioFilePlayer::new(output_device, stream_config, AUDIO_BUFFER_SIZE);
+    let stream_builder =
+        lib::AudioStreamBuilder::new(output_device, stream_config, AUDIO_BUFFER_SIZE);
 
-    run(&mut player, "samples");
+    run(stream_builder, "samples");
 }
 
 /// # Arguments
 /// + `dir`: Path to directory containing sound files.
-fn run(player: &mut lib::AudioFilePlayer, dir: impl AsRef<Path>) {
+fn run(stream_builder: lib::AudioStreamBuilder, dir: impl AsRef<Path>) {
     let playlist = create_playlist_from_dir(dir.as_ref());
-    let mut jukebox = lib::Jukebox::new(playlist);
-    let mut input = String::new();
-    loop {
-        // TODO: Don't wait for new line.
-        input.clear();
-        tracing::info!("waiting for input");
-        io::stdin().read_line(&mut input).expect("invalid input");
-        let cmd = input.trim();
-        let Some(cmd) = Command::from_str(cmd) else {
-            continue;
-        };
+    let queue = lib::PlaylistQueue::new(playlist);
 
-        match cmd {
-            Command::Next => next_song(&mut jukebox, player),
-            Command::Previous => previous_song(&mut jukebox, player),
-            Command::TogglePlay => toggle_play(&mut jukebox),
+    let (input_tx, input_rx) = channel::bounded(1);
+    let input_listener = input_actor::InputActor::new(input_tx);
+    let _t_input = std::thread::Builder::new()
+        .name("input actor".to_string())
+        .spawn(move || input_listener.run())
+        .expect("could not launch input actor");
+
+    let (command_tx, command_rx) = channel::bounded(1);
+    let (event_tx, event_rx) = channel::bounded(1);
+    let _t_player = std::thread::Builder::new()
+        .name("player actor".to_string())
+        .spawn(move || {
+            let mut player =
+                player_actor::AudioPlayerActor::new(stream_builder, command_rx, event_tx);
+
+            player.run();
+        })
+        .expect("could not launch player actor");
+
+    let mut jukebox = JukeBox::new(queue, input_rx, command_tx, event_rx);
+    jukebox.run()
+}
+
+struct JukeBox {
+    queue: lib::PlaylistQueue,
+    input_rx: channel::Receiver<Command>,
+    command_tx: channel::Sender<player_actor::Command>,
+    event_rx: channel::Receiver<player_actor::Event>,
+    stream_state: Option<lib::StreamStateLock>,
+}
+
+impl JukeBox {
+    pub fn new(
+        queue: lib::PlaylistQueue,
+        input_rx: channel::Receiver<Command>,
+        command_tx: channel::Sender<player_actor::Command>,
+        event_rx: channel::Receiver<player_actor::Event>,
+    ) -> Self {
+        Self {
+            queue,
+            input_rx,
+            command_tx,
+            event_rx,
+            stream_state: None,
         }
     }
-}
 
-fn next_song(jukebox: &mut lib::Jukebox, player: &mut lib::AudioFilePlayer) {
-    let file = jukebox.next().unwrap();
-    tracing::info!("playing {:?}", file.path());
-    player.play(file).unwrap();
-}
+    fn run(&mut self) {
+        loop {
+            select! {
+                recv(self.input_rx) -> cmd => match cmd{
+                    Ok(cmd) => {
+                        tracing::debug!("recieved command {cmd:?}");
+                        self.handle_command(cmd).unwrap();
+                    }
+                    Err(_) => {
+                        tracing::debug!("command channel closed");
+                        break;
+                    }
+                },
 
-fn previous_song(jukebox: &mut lib::Jukebox, player: &mut lib::AudioFilePlayer) {
-    let file = jukebox.next_back().unwrap();
-    tracing::info!("playing {:?}", file.path());
-    player.play(file).unwrap();
-}
+                recv(self.event_rx) -> event => match event{
+                    Ok(event) => tracing::debug!(?event),
+                    Err(_) => {
+                        tracing::debug!("input channel closed");
+                        break;
+                    }
+                },
+            }
+        }
+    }
 
-fn toggle_play(player: &mut lib::Jukebox) {
-    tracing::info!("play");
+    fn handle_command(&mut self, cmd: Command) -> Result<(), ()> {
+        match cmd {
+            Command::Next => {
+                self.play_next_song().map_err(|_| ())?;
+                //self.play().map_err(|_| ())?;
+            }
+            Command::Previous => {
+                self.play_previous_song().map_err(|_| ())?;
+                //self.play().map_err(|_| ())?;
+            }
+            Command::TogglePlay => {
+                self.toggle_play().map_err(|_| ())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn play_next_song(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
+        let file = self.queue.next().unwrap().clone();
+        self.load_and_play(file.clone())
+    }
+
+    fn play_previous_song(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
+        let file = self.queue.next_back().unwrap().clone();
+        self.load_and_play(file)
+    }
+
+    fn load_and_play(
+        &mut self,
+        file: PathBuf,
+    ) -> Result<(), channel::SendError<player_actor::Command>> {
+        let (res_tx, res_rx) = channel::bounded(1);
+        self.command_tx
+            .send(player_actor::Command::Load(file.clone(), res_tx))?;
+
+        match res_rx.recv().unwrap() {
+            Ok(_) => tracing::trace!("{file:?} loaded"),
+            Err(err) => tracing::error!(?err),
+        }
+
+        let (res_tx, res_rx) = channel::bounded(1);
+        self.command_tx
+            .send(player_actor::Command::Play(res_tx))
+            .unwrap();
+
+        match res_rx.recv().unwrap() {
+            Ok(stream_state) => {
+                tracing::info!("{file:?} playing");
+                let _ = self.stream_state.insert(stream_state);
+            }
+            Err(err) => tracing::error!(?err),
+        }
+
+        Ok(())
+    }
+
+    fn toggle_play(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
+        let Some(state_lock) = self.stream_state.as_ref() else {
+            return Ok(());
+        };
+
+        let mut state = state_lock.lock().unwrap();
+        if state.is_playing() {
+            *state = lib::StreamState::Paused;
+            tracing::info!("Paused");
+        } else {
+            *state = lib::StreamState::Playing;
+            tracing::info!("Playing");
+        }
+
+        Ok(())
+    }
 }
 
 /// Creates a playlist from files in a directory.
@@ -71,9 +198,7 @@ fn create_playlist_from_dir(dir: impl AsRef<Path>) -> lib::Playlist {
             };
 
             if ctx.streams().best(ffm::media::Type::Audio).is_some() {
-                fs::canonicalize(entry.into_path())
-                    .ok()
-                    .map(|path| lib::AudioFile::new(path, ctx))
+                fs::canonicalize(entry.into_path()).ok()
             } else {
                 None
             }
@@ -100,21 +225,11 @@ fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
     (device, supported_config_range.with_max_sample_rate())
 }
 
+#[derive(Debug)]
 enum Command {
     Next,
     Previous,
     TogglePlay,
-}
-
-impl Command {
-    pub fn from_str(input: impl AsRef<str>) -> Option<Self> {
-        match input.as_ref() {
-            "j" => Some(Self::Previous),
-            "k" => Some(Self::Next),
-            "p" => Some(Self::TogglePlay),
-            _ => None,
-        }
-    }
 }
 
 mod log {

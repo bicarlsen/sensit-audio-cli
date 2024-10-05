@@ -15,8 +15,9 @@ pub struct AudioFile {
 }
 
 impl AudioFile {
-    pub fn new(path: PathBuf, ctx: ffm::format::context::Input) -> Self {
-        Self { path, ctx }
+    pub fn from_path(path: PathBuf) -> Result<Self, ffm::Error> {
+        let ctx = ffm::format::input(&path)?;
+        Ok(Self { path, ctx })
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -33,21 +34,21 @@ impl AudioFile {
 }
 
 #[derive(Debug, derive_more::Deref, derive_more::DerefMut)]
-pub struct Playlist(Vec<AudioFile>);
+pub struct Playlist(Vec<PathBuf>);
 impl Playlist {
-    pub fn new(files: Vec<AudioFile>) -> Self {
+    pub fn new(files: Vec<PathBuf>) -> Self {
         Self(files)
     }
 }
 
 #[derive(Debug)]
-pub struct Jukebox {
+pub struct PlaylistQueue {
     playlist: Playlist,
     current_track: usize,
     cfg: AudioPlayConfig,
 }
 
-impl Jukebox {
+impl PlaylistQueue {
     pub fn new(playlist: Playlist) -> Self {
         Self {
             playlist,
@@ -56,32 +57,32 @@ impl Jukebox {
         }
     }
 
-    pub fn next(&mut self) -> Option<&mut AudioFile> {
+    pub fn next(&mut self) -> Option<&PathBuf> {
         self.current_track += 1;
         if self.cfg.loop_playlist {
             if self.current_track >= self.playlist.len() {
                 self.current_track = 0;
             }
 
-            Some(&mut self.playlist[self.current_track])
+            Some(&self.playlist[self.current_track])
         } else {
-            self.playlist.get_mut(self.current_track)
+            self.playlist.get(self.current_track)
         }
     }
 
-    pub fn next_back(&mut self) -> Option<&mut AudioFile> {
+    pub fn next_back(&mut self) -> Option<&PathBuf> {
         if self.cfg.loop_playlist {
             if self.current_track == 0 {
                 self.current_track = self.playlist.len();
             }
             self.current_track -= 1;
 
-            Some(&mut self.playlist[self.current_track])
+            Some(&self.playlist[self.current_track])
         } else {
             if self.current_track == 0 {
                 None
             } else {
-                Some(&mut self.playlist[self.current_track])
+                Some(&self.playlist[self.current_track])
             }
         }
     }
@@ -111,44 +112,40 @@ impl Default for AudioPlayConfig {
 
 type BufferProd<T> = ringbuf::CachingProd<Arc<ringbuf::HeapRb<T>>>;
 type BufferCons<T> = ringbuf::CachingCons<Arc<ringbuf::HeapRb<T>>>;
-pub struct AudioFilePlayer {
+pub struct AudioStreamBuilder {
     device: cpal::Device,
     stream_config: cpal::SupportedStreamConfig,
-    buffer_prod: BufferProd<f32>,
-
-    // TODO: Need better data structure here.
-    // Data callback where this is consumed is called rapidly and often
-    // leading to the mutex being un/locked rapidly and often.
-    // This could allow for multiple processes to interleave and harm performance.
-    // Another option would be to create a new audio buffer for each call of `play`,
-    // but seems wasteful of memory.
-    buffer_cons: Arc<Mutex<BufferCons<f32>>>,
+    buffer_size: usize,
 }
-impl AudioFilePlayer {
+
+impl AudioStreamBuilder {
     pub fn new(
         device: cpal::Device,
         stream_config: cpal::SupportedStreamConfig,
         buffer_size: usize,
     ) -> Self {
-        let (buffer_prod, buffer_cons) = ringbuf::HeapRb::new(buffer_size).split();
-
         Self {
             device,
             stream_config,
-            buffer_prod,
-            buffer_cons: Arc::new(Mutex::new(buffer_cons)),
+            buffer_size,
         }
     }
 
     /// Plays an audio file
     ///
+    /// # Returns
+    /// (play/pause control, stream)
+    ///
     /// # Panics
     /// + If the player is not ready. (See [`Self::is_ready`].)
-    pub fn play(&mut self, audio: &mut AudioFile) -> Result<(), ffm::Error> {
-        audio.ctx.seek(0, ..0).unwrap();
+    pub fn load(&self, mut audio_file: AudioFile) -> Result<AudioStream, ffm::Error> {
+        // NOTE: Could create buffer pool for reuse.
+        let (buffer_prod, mut buffer_cons) = ringbuf::HeapRb::new(self.buffer_size).split();
+
+        audio_file.ctx_mut().seek(0, ..0).unwrap();
 
         // Find the audio stream and its index
-        let audio_stream = audio
+        let audio_stream = audio_file
             .ctx()
             .streams()
             .best(ffm::media::Type::Audio)
@@ -158,10 +155,10 @@ impl AudioFilePlayer {
 
         // Create a decoder
         let ctx = ffm::codec::Context::from_parameters(audio_stream.parameters())?;
-        let mut audio_decoder = ctx.decoder().audio()?;
+        let audio_decoder = ctx.decoder().audio()?;
 
         // Set up a resampler for the audio
-        let mut resampler = ffm::software::resampling::context::Context::get(
+        let resampler = ffm::software::resampling::context::Context::get(
             audio_decoder.format(),
             audio_decoder.channel_layout(),
             audio_decoder.rate(),
@@ -172,12 +169,11 @@ impl AudioFilePlayer {
 
         let audio_stream = match self.stream_config.sample_format() {
             cpal::SampleFormat::F32 => {
-                let buffer_cons = self.buffer_cons.clone();
                 self.device.build_output_stream(
                     &self.stream_config.clone().into(),
                     move |data: &mut [f32], cbinfo| {
                         // Copy to the audio buffer (if there aren't enough samples, write_audio will write silence)
-                        write_audio(data, &mut *buffer_cons.lock().unwrap(), &cbinfo);
+                        write_audio(data, &mut buffer_cons, &cbinfo);
                     },
                     |err| eprintln!("error occurred on the audio output stream: {}", err),
                     None,
@@ -189,6 +185,34 @@ impl AudioFilePlayer {
         }
         .unwrap();
 
+        Ok(AudioStream {
+            audio_file,
+            audio_stream,
+            stream_index: audio_stream_index,
+            decoder: audio_decoder,
+            resampler,
+            buffer_prod,
+            state: Arc::new(Mutex::new(StreamState::Paused)),
+        })
+    }
+}
+
+pub struct AudioStream {
+    audio_file: AudioFile,
+    audio_stream: cpal::Stream,
+    stream_index: usize,
+    decoder: ffm::decoder::Audio,
+    resampler: ffm::software::resampling::context::Context,
+    buffer_prod: BufferProd<f32>,
+    state: StreamStateLock,
+}
+
+impl AudioStream {
+    pub fn state(&self) -> Arc<Mutex<StreamState>> {
+        self.state.clone()
+    }
+
+    pub fn play(&mut self) -> Result<(), ffm::Error> {
         let mut receive_and_queue_audio_frames =
             |decoder: &mut ffm::decoder::Audio| -> Result<(), ffm::Error> {
                 let mut decoded = ffm::frame::Audio::empty();
@@ -197,7 +221,7 @@ impl AudioFilePlayer {
                 while decoder.receive_frame(&mut decoded).is_ok() {
                     // Resample the frame's audio into another frame
                     let mut resampled = ffm::frame::Audio::empty();
-                    resampler.run(&decoded, &mut resampled)?;
+                    self.resampler.run(&decoded, &mut resampled)?;
 
                     // DON'T just use resampled.data(0).len() -- it might not be fully populated
                     // Grab the right number of bytes based on sample count, bytes per sample, and number of channels.
@@ -216,23 +240,54 @@ impl AudioFilePlayer {
             };
 
         // Start playing
-        audio_stream.play().unwrap();
+        self.audio_stream.play().unwrap();
+        *self.state.lock().unwrap() = StreamState::Playing;
+        for (stream, packet) in self.audio_file.ctx_mut().packets() {
+            if self.state.lock().unwrap().is_paused() {
+                loop {
+                    if self.state.lock().unwrap().is_playing() {
+                        self.audio_stream.play().unwrap();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
 
-        for (stream, packet) in audio.ctx_mut().packets() {
             // Look for audio packets (ignore video and others)
-            if stream.index() == audio_stream_index {
+            if stream.index() == self.stream_index {
                 // Send the packet to the decoder; it will combine them into frames.
                 // In practice though, 1 packet = 1 frame
-                audio_decoder.send_packet(&packet)?;
+                self.decoder.send_packet(&packet)?;
 
                 // Queue the audio for playback (and block if the queue is full)
-                receive_and_queue_audio_frames(&mut audio_decoder)?;
+                receive_and_queue_audio_frames(&mut self.decoder)?;
             }
         }
 
+        *self.state.lock().unwrap() = StreamState::Done;
         Ok(())
     }
+
+    pub fn pause() {}
 }
+
+pub enum StreamState {
+    Playing,
+    Paused,
+    Done,
+}
+
+impl StreamState {
+    pub fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused)
+    }
+
+    pub fn is_playing(&self) -> bool {
+        matches!(self, Self::Playing)
+    }
+}
+
+pub type StreamStateLock = Arc<Mutex<StreamState>>;
 
 trait SampleFormatConversion {
     fn as_ffmpeg_sample(&self) -> ffm::format::Sample;
