@@ -110,11 +110,9 @@ impl JukeBox {
         match cmd {
             Command::Next => {
                 self.play_next_song().map_err(|_| ())?;
-                //self.play().map_err(|_| ())?;
             }
             Command::Previous => {
                 self.play_previous_song().map_err(|_| ())?;
-                //self.play().map_err(|_| ())?;
             }
             Command::TogglePlay => {
                 self.toggle_play().map_err(|_| ())?;
@@ -125,19 +123,31 @@ impl JukeBox {
     }
 
     fn play_next_song(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
-        let file = self.queue.next().unwrap().clone();
-        self.load_and_play(file.clone())
+        if let Some(file) = self.queue.next().cloned() {
+            self.load_and_play(file.clone())
+        } else {
+            tracing::info!("end of playlist");
+            Ok(())
+        }
     }
 
     fn play_previous_song(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
-        let file = self.queue.next_back().unwrap().clone();
-        self.load_and_play(file)
+        if let Some(file) = self.queue.next_back().cloned() {
+            self.load_and_play(file)
+        } else {
+            tracing::info!("end of playlist");
+            Ok(())
+        }
     }
 
     fn load_and_play(
         &mut self,
         file: PathBuf,
     ) -> Result<(), channel::SendError<player_actor::Command>> {
+        if let Some(state_lock) = self.stream_state.as_ref() {
+            *state_lock.lock().unwrap() = lib::StreamState::Stop;
+        };
+
         let (res_tx, res_rx) = channel::bounded(1);
         self.command_tx
             .send(player_actor::Command::Load(file.clone(), res_tx))?;
@@ -170,10 +180,10 @@ impl JukeBox {
 
         let mut state = state_lock.lock().unwrap();
         if state.is_playing() {
-            *state = lib::StreamState::Paused;
+            *state = lib::StreamState::Pause;
             tracing::info!("Paused");
         } else {
-            *state = lib::StreamState::Playing;
+            *state = lib::StreamState::Play;
             tracing::info!("Playing");
         }
 

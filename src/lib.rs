@@ -192,7 +192,7 @@ impl AudioStreamBuilder {
             decoder: audio_decoder,
             resampler,
             buffer_prod,
-            state: Arc::new(Mutex::new(StreamState::Paused)),
+            state: Arc::new(Mutex::new(StreamState::Pause)),
         })
     }
 }
@@ -241,16 +241,23 @@ impl AudioStream {
 
         // Start playing
         self.audio_stream.play().unwrap();
-        *self.state.lock().unwrap() = StreamState::Playing;
-        for (stream, packet) in self.audio_file.ctx_mut().packets() {
-            if self.state.lock().unwrap().is_paused() {
-                loop {
-                    if self.state.lock().unwrap().is_playing() {
-                        self.audio_stream.play().unwrap();
-                        break;
-                    }
+        *self.state.lock().unwrap() = StreamState::Play;
+        'play: for (stream, packet) in self.audio_file.ctx_mut().packets() {
+            let state = self.state.lock().unwrap();
+            if state.is_paused() {
+                drop(state);
+                'pause: loop {
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                    let state = self.state.lock().unwrap();
+                    if state.is_playing() {
+                        self.audio_stream.play().unwrap();
+                        break 'pause;
+                    } else if state.is_stopped() {
+                        break 'play;
+                    }
                 }
+            } else if state.is_stopped() {
+                break 'play;
             }
 
             // Look for audio packets (ignore video and others)
@@ -264,7 +271,7 @@ impl AudioStream {
             }
         }
 
-        *self.state.lock().unwrap() = StreamState::Done;
+        *self.state.lock().unwrap() = StreamState::Stop;
         Ok(())
     }
 
@@ -272,18 +279,24 @@ impl AudioStream {
 }
 
 pub enum StreamState {
-    Playing,
-    Paused,
-    Done,
+    Play,
+    Pause,
+
+    /// Stream can not be resumed
+    Stop,
 }
 
 impl StreamState {
     pub fn is_paused(&self) -> bool {
-        matches!(self, Self::Paused)
+        matches!(self, Self::Pause)
     }
 
     pub fn is_playing(&self) -> bool {
-        matches!(self, Self::Playing)
+        matches!(self, Self::Play)
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stop)
     }
 }
 
