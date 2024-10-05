@@ -212,16 +212,18 @@ impl AudioStream {
         self.state.clone()
     }
 
-    pub fn play(&mut self) -> Result<(), ffm::Error> {
+    pub fn play(&mut self) -> Result<(), error::AudioStream> {
         let mut receive_and_queue_audio_frames =
-            |decoder: &mut ffm::decoder::Audio| -> Result<(), ffm::Error> {
+            |decoder: &mut ffm::decoder::Audio| -> Result<(), error::AudioStream> {
                 let mut decoded = ffm::frame::Audio::empty();
 
                 // Ask the decoder for frames
                 while decoder.receive_frame(&mut decoded).is_ok() {
                     // Resample the frame's audio into another frame
                     let mut resampled = ffm::frame::Audio::empty();
-                    self.resampler.run(&decoded, &mut resampled)?;
+                    self.resampler
+                        .run(&decoded, &mut resampled)
+                        .map_err(|err| error::AudioStream::Resample(err))?;
 
                     // DON'T just use resampled.data(0).len() -- it might not be fully populated
                     // Grab the right number of bytes based on sample count, bytes per sample, and number of channels.
@@ -240,50 +242,55 @@ impl AudioStream {
             };
 
         // Start playing
-        self.audio_stream.play().unwrap();
         *self.state.lock().unwrap() = StreamState::Play;
-        'play: for (stream, packet) in self.audio_file.ctx_mut().packets() {
+        self.audio_stream.play()?;
+        for (stream, packet) in self.audio_file.ctx_mut().packets() {
             let state = self.state.lock().unwrap();
             if state.is_paused() {
                 drop(state);
-                'pause: loop {
+                self.audio_stream.pause()?;
+                loop {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     let state = self.state.lock().unwrap();
                     if state.is_playing() {
-                        self.audio_stream.play().unwrap();
-                        break 'pause;
+                        self.audio_stream.play()?;
+                        break;
                     } else if state.is_stopped() {
-                        break 'play;
+                        return Ok(());
                     }
                 }
             } else if state.is_stopped() {
-                break 'play;
+                return Ok(());
             }
 
             // Look for audio packets (ignore video and others)
             if stream.index() == self.stream_index {
                 // Send the packet to the decoder; it will combine them into frames.
                 // In practice though, 1 packet = 1 frame
-                self.decoder.send_packet(&packet)?;
+                self.decoder
+                    .send_packet(&packet)
+                    .map_err(|err| error::AudioStream::Decode(err))?;
 
                 // Queue the audio for playback (and block if the queue is full)
                 receive_and_queue_audio_frames(&mut self.decoder)?;
             }
         }
 
-        *self.state.lock().unwrap() = StreamState::Stop;
+        *self.state.lock().unwrap() = StreamState::Done;
         Ok(())
     }
-
-    pub fn pause() {}
 }
 
+#[derive(Debug)]
 pub enum StreamState {
     Play,
     Pause,
 
-    /// Stream can not be resumed
+    /// Stream stopped before end.
     Stop,
+
+    /// Stream played all the way through.
+    Done,
 }
 
 impl StreamState {
@@ -297,6 +304,10 @@ impl StreamState {
 
     pub fn is_stopped(&self) -> bool {
         matches!(self, Self::Stop)
+    }
+
+    pub fn is_done(&self) -> bool {
+        matches!(self, Self::Done)
     }
 }
 
@@ -354,4 +365,32 @@ fn write_audio<T: cpal::Sample>(
     }
 }
 
-pub mod error {}
+pub mod error {
+    use ffmpeg_next as ffm;
+
+    #[derive(Debug)]
+    pub enum AudioStream {
+        Resample(ffm::Error),
+        Decode(ffm::util::error::Error),
+        DeviceNotAvailable,
+        Other(String),
+    }
+
+    impl From<cpal::PlayStreamError> for AudioStream {
+        fn from(value: cpal::PlayStreamError) -> Self {
+            match value {
+                cpal::PlayStreamError::DeviceNotAvailable => Self::DeviceNotAvailable,
+                cpal::PlayStreamError::BackendSpecific { err } => Self::Other(err.description),
+            }
+        }
+    }
+
+    impl From<cpal::PauseStreamError> for AudioStream {
+        fn from(value: cpal::PauseStreamError) -> Self {
+            match value {
+                cpal::PauseStreamError::DeviceNotAvailable => Self::DeviceNotAvailable,
+                cpal::PauseStreamError::BackendSpecific { err } => Self::Other(err.description),
+            }
+        }
+    }
+}

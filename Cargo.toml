@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.89"
 clap = "4.5.18"
 cpal = "0.15.3"
 crossbeam = "0.8.4"
 derive_more = { version = "1.0.0", features = ["debug", "deref", "deref_mut"] }
 ffmpeg-next = "7.1.0"
 ringbuf = "0.4.7"
+thiserror = "1.0.64"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 walkdir = "2.5.0"

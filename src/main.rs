@@ -86,18 +86,31 @@ impl JukeBox {
             select! {
                 recv(self.input_rx) -> cmd => match cmd{
                     Ok(cmd) => {
-                        tracing::debug!("recieved command {cmd:?}");
-                        self.handle_command(cmd).unwrap();
+                        tracing::debug!(?cmd);
+                        if let Err(err) = self.handle_command(cmd) {
+                            tracing::info!("An error occured");
+                            tracing::error!(?err);
+                            break;
+                        };
                     }
                     Err(_) => {
+                        tracing::info!("An error occured");
                         tracing::debug!("command channel closed");
                         break;
                     }
                 },
 
                 recv(self.event_rx) -> event => match event{
-                    Ok(event) => tracing::debug!(?event),
+                    Ok(event) => {
+                        tracing::debug!(?event);
+                        if let Err(err) = self.handle_event(event) {
+                            tracing::info!("An error occured");
+                            tracing::error!(?err);
+                            break;
+                        }
+                    },
                     Err(_) => {
+                        tracing::info!("An error occured");
                         tracing::debug!("input channel closed");
                         break;
                     }
@@ -122,28 +135,39 @@ impl JukeBox {
         Ok(())
     }
 
-    fn play_next_song(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
+    fn handle_event(&mut self, event: player_actor::Event) -> Result<(), error::Player> {
+        match event {
+            player_actor::Event::Done => self.play_next_song(),
+            player_actor::Event::StreamErr(err) => {
+                tracing::error!(?err);
+                Err(error::Player::Stream(err))
+            }
+        }
+    }
+
+    fn play_next_song(&mut self) -> Result<(), error::Player> {
         if let Some(file) = self.queue.next().cloned() {
             self.load_and_play(file.clone())
         } else {
-            tracing::info!("end of playlist");
+            tracing::info!("End of playlist");
             Ok(())
         }
     }
 
-    fn play_previous_song(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
+    fn play_previous_song(&mut self) -> Result<(), error::Player> {
         if let Some(file) = self.queue.next_back().cloned() {
             self.load_and_play(file)
         } else {
-            tracing::info!("end of playlist");
+            tracing::info!("End of playlist");
             Ok(())
         }
     }
 
-    fn load_and_play(
-        &mut self,
-        file: PathBuf,
-    ) -> Result<(), channel::SendError<player_actor::Command>> {
+    /// Loads a new song to the player actor and begins playing it.
+    ///
+    /// # Returns
+    /// + `Err` if the command channel closed.
+    fn load_and_play(&mut self, file: PathBuf) -> Result<(), error::Player> {
         if let Some(state_lock) = self.stream_state.as_ref() {
             *state_lock.lock().unwrap() = lib::StreamState::Stop;
         };
@@ -152,25 +176,26 @@ impl JukeBox {
         self.command_tx
             .send(player_actor::Command::Load(file.clone(), res_tx))?;
 
-        match res_rx.recv().unwrap() {
-            Ok(_) => tracing::trace!("{file:?} loaded"),
-            Err(err) => tracing::error!(?err),
+        if let Err(err) = res_rx.recv()? {
+            tracing::error!(?err);
+            return Err(err.into());
         }
+        tracing::trace!("{file:?} loaded");
 
         let (res_tx, res_rx) = channel::bounded(1);
-        self.command_tx
-            .send(player_actor::Command::Play(res_tx))
-            .unwrap();
+        self.command_tx.send(player_actor::Command::Play(res_tx))?;
 
-        match res_rx.recv().unwrap() {
+        match res_rx.recv()? {
             Ok(stream_state) => {
-                tracing::info!("{file:?} playing");
+                tracing::debug!("{:?}", stream_state.lock().unwrap());
                 let _ = self.stream_state.insert(stream_state);
+                Ok(())
             }
-            Err(err) => tracing::error!(?err),
+            Err(err) => {
+                tracing::error!(?err);
+                Err(err.into())
+            }
         }
-
-        Ok(())
     }
 
     fn toggle_play(&mut self) -> Result<(), channel::SendError<player_actor::Command>> {
@@ -240,6 +265,61 @@ enum Command {
     Next,
     Previous,
     TogglePlay,
+}
+
+mod error {
+    use super::player_actor;
+    use crossbeam::channel;
+    use ffmpeg_next as ffm;
+    use sensit_audio_cli as lib;
+
+    #[derive(thiserror::Error, Debug)]
+    pub enum Player {
+        #[error("channel closed")]
+        Channel,
+
+        #[error("no stream loaded")]
+        NoStream,
+
+        #[error("could not load audio: {0}")]
+        Load(ffm::Error),
+
+        #[error("could not play audio: {0:?}")]
+        Stream(lib::error::AudioStream),
+    }
+
+    impl<T> From<channel::SendError<T>> for Player {
+        fn from(_: channel::SendError<T>) -> Self {
+            Self::Channel
+        }
+    }
+
+    impl From<channel::RecvError> for Player {
+        fn from(_: channel::RecvError) -> Self {
+            Self::Channel
+        }
+    }
+
+    impl From<player_actor::error::Load> for Player {
+        fn from(value: player_actor::error::Load) -> Self {
+            use player_actor::error::Load;
+
+            match value {
+                Load::Audio(err) => Self::Load(err),
+                Load::Stream(err) => Self::Load(err),
+            }
+        }
+    }
+
+    impl From<player_actor::error::Play> for Player {
+        fn from(value: player_actor::error::Play) -> Self {
+            use player_actor::error::Play;
+
+            match value {
+                Play::NoStream => Self::NoStream,
+            }
+        }
+    }
 }
 
 mod log {
