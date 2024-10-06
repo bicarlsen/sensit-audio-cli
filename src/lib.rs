@@ -225,6 +225,8 @@ impl AudioStreamBuilder {
     }
 }
 
+/// # Notes
+/// + !Send
 pub struct AudioStream {
     audio_file: AudioFile,
     audio_stream: cpal::Stream,
