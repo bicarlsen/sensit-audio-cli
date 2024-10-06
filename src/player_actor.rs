@@ -12,12 +12,12 @@ pub enum Event {
 }
 
 pub type LoadResponse = Result<(), error::Load>;
-pub type PlayResponse = Result<lib::StreamStateLock, error::Play>;
+pub type PrepareResponse = Result<lib::StreamStateLock, error::Play>;
 
 #[derive(Debug)]
 pub enum Command {
     Load(PathBuf, channel::Sender<LoadResponse>),
-    Play(channel::Sender<PlayResponse>),
+    Prepare(channel::Sender<PrepareResponse>),
 }
 
 pub struct AudioPlayerActor {
@@ -50,8 +50,8 @@ impl AudioPlayerActor {
                             tracing::error!("response channel closed");
                         }
                     }
-                    Command::Play(res_tx) => {
-                        if let Err(_) = self.handle_play(res_tx) {
+                    Command::Prepare(res_tx) => {
+                        if let Err(_) = self.handle_prepare(res_tx) {
                             tracing::error!("response channel closed");
                         }
                     }
@@ -97,14 +97,17 @@ impl AudioPlayerActor {
 
     /// # Returns
     /// + `Err` if the response could not be handled.
-    fn handle_play(&mut self, res_tx: channel::Sender<PlayResponse>) -> Result<(), error::Channel> {
+    fn handle_prepare(
+        &mut self,
+        res_tx: channel::Sender<PrepareResponse>,
+    ) -> Result<(), error::Channel> {
         let Some(stream) = self.stream.as_mut() else {
             res_tx.send(Err(error::Play::NoStream))?;
             return Ok(());
         };
 
         res_tx.send(Ok(stream.state())).unwrap();
-        if let Err(err) = stream.play().map_err(Event::StreamErr) {
+        if let Err(err) = stream.load().map_err(Event::StreamErr) {
             tracing::debug!(?err);
             self.event_tx.send(err)?;
             return Ok(());

@@ -44,7 +44,7 @@ impl Playlist {
 #[derive(Debug)]
 pub struct PlaylistQueue {
     playlist: Playlist,
-    current_track: usize,
+    index: usize,
     cfg: AudioPlayConfig,
 }
 
@@ -52,47 +52,68 @@ impl PlaylistQueue {
     pub fn new(playlist: Playlist) -> Self {
         Self {
             playlist,
-            current_track: 0,
+            index: 0,
             cfg: AudioPlayConfig::default(),
         }
     }
 
+    pub fn current(&self) -> Option<&PathBuf> {
+        self.playlist.get(self.index)
+    }
+
     pub fn next(&mut self) -> Option<&PathBuf> {
         if self.cfg.loop_playlist {
-            self.current_track += 1;
-            if self.current_track >= self.playlist.len() {
-                self.current_track = 0;
+            self.index += 1;
+            if self.index >= self.playlist.len() {
+                self.index = 0;
             }
 
-            Some(&self.playlist[self.current_track])
+            Some(&self.playlist[self.index])
         } else {
-            if self.current_track < self.playlist.len() {
-                self.current_track += 1;
+            if self.index < self.playlist.len() {
+                self.index += 1;
             }
-            self.playlist.get(self.current_track)
+            self.playlist.get(self.index)
         }
     }
 
     pub fn next_back(&mut self) -> Option<&PathBuf> {
         if self.cfg.loop_playlist {
-            if self.current_track == 0 {
-                self.current_track = self.playlist.len();
+            if self.index == 0 {
+                self.index = self.playlist.len();
             }
-            self.current_track -= 1;
+            self.index -= 1;
 
-            Some(&self.playlist[self.current_track])
+            Some(&self.playlist[self.index])
         } else {
-            if self.current_track == 0 {
+            if self.index == 0 {
                 None
             } else {
-                self.current_track -= 1;
-                Some(&self.playlist[self.current_track])
+                self.index -= 1;
+                Some(&self.playlist[self.index])
             }
         }
     }
 
-    pub fn to_beginning(&mut self) {
-        self.current_track = 0;
+    pub fn playlist(&self) -> &Vec<PathBuf> {
+        &self.playlist
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn len(&self) -> usize {
+        self.playlist.len()
+    }
+
+    pub fn set_index(&mut self, index: usize) -> Result<(), error::InvalidIndex> {
+        if index >= self.playlist.len() {
+            Err(error::InvalidIndex)
+        } else {
+            self.index = index;
+            Ok(())
+        }
     }
 
     pub fn is_looping(&self) -> bool {
@@ -119,7 +140,6 @@ impl Default for AudioPlayConfig {
 }
 
 type BufferProd<T> = ringbuf::CachingProd<Arc<ringbuf::HeapRb<T>>>;
-type BufferCons<T> = ringbuf::CachingCons<Arc<ringbuf::HeapRb<T>>>;
 pub struct AudioStreamBuilder {
     device: cpal::Device,
     stream_config: cpal::SupportedStreamConfig,
@@ -220,7 +240,7 @@ impl AudioStream {
         self.state.clone()
     }
 
-    pub fn play(&mut self) -> Result<(), error::AudioStream> {
+    pub fn load(&mut self) -> Result<(), error::AudioStream> {
         let mut receive_and_queue_audio_frames =
             |decoder: &mut ffm::decoder::Audio| -> Result<(), error::AudioStream> {
                 let mut decoded = ffm::frame::Audio::empty();
@@ -250,7 +270,6 @@ impl AudioStream {
             };
 
         // Start playing
-        *self.state.lock().unwrap() = StreamState::Play;
         self.audio_stream.play()?;
         for (stream, packet) in self.audio_file.ctx_mut().packets() {
             let state = self.state.lock().unwrap();
@@ -258,7 +277,7 @@ impl AudioStream {
                 drop(state);
                 self.audio_stream.pause()?;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     let state = self.state.lock().unwrap();
                     if state.is_playing() {
                         self.audio_stream.play()?;
@@ -289,7 +308,7 @@ impl AudioStream {
     }
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum StreamState {
     Play,
     Pause,
@@ -375,6 +394,9 @@ fn write_audio<T: cpal::Sample>(
 
 pub mod error {
     use ffmpeg_next as ffm;
+
+    #[derive(Debug)]
+    pub struct InvalidIndex;
 
     #[derive(Debug)]
     pub enum AudioStream {

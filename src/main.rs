@@ -21,25 +21,39 @@ use crossbeam::{channel, select};
 use ffmpeg_next as ffm;
 use sensit_audio_cli as lib;
 use std::{
-    env, fs,
+    cmp, env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
+
+macro_rules! write_trace {
+    ($dst:expr, $($arg:tt)*) => {
+        if let Err(err) = $dst.write_fmt(std::format_args!($($arg)*)) {
+            tracing::error!(?err);
+        }
+    };
+}
 
 const AUDIO_BUFFER_SIZE: usize = 8192;
 const CMD_KEY_QUIT: &str = "q";
 const CMD_KEY_PREVIOUS: &str = "j";
 const CMD_KEY_NEXT: &str = "k";
+const CMD_KEY_RESTART: &str = "r";
 const CMD_KEY_TOGGLE_PLAY: &str = "p";
 const CMD_KEY_TOGGLE_LOOP: &str = "l";
+const CMD_KEY_TOGGLE_AUTOPLAY: &str = "a";
+const CMD_KEY_TOGGLE_SHOW_STATE: &str = "s";
 
 #[derive(Debug)]
 enum Command {
     Quit,
     Next,
     Previous,
+    Restart,
     TogglePlay,
     ToggleLoop,
+    ToggleAutoplay,
+    ToggleShowState,
 }
 
 pub fn main() -> Result<(), ()> {
@@ -104,12 +118,36 @@ fn run(stream_builder: lib::AudioStreamBuilder, dir: impl AsRef<Path>) {
     jukebox.run()
 }
 
+struct JukeboxConfig {
+    /// Automatically play the next song.
+    autoplay: bool,
+
+    /// Show the current player state.
+    show_state: bool,
+
+    /// The number of songs to show on either side of the current one.
+    /// i.e. `0` will only show the current song,
+    /// `1` will show the the previous, current, and next song.
+    playlist_buffer: usize,
+}
+
+impl Default for JukeboxConfig {
+    fn default() -> Self {
+        Self {
+            autoplay: true,
+            playlist_buffer: 1,
+            show_state: true,
+        }
+    }
+}
+
 struct JukeBox {
     queue: lib::PlaylistQueue,
     input_rx: channel::Receiver<Command>,
     command_tx: channel::Sender<player_actor::Command>,
     event_rx: channel::Receiver<player_actor::Event>,
     stream_state: Option<lib::StreamStateLock>,
+    cfg: JukeboxConfig,
 }
 
 impl JukeBox {
@@ -125,14 +163,18 @@ impl JukeBox {
             command_tx,
             event_rx,
             stream_state: None,
+            cfg: JukeboxConfig::default(),
         }
     }
 
     fn run(&mut self) {
-        self.play_next_song()
+        self.prepare_current_song()
             .map_err(|_| ())
             .expect("could not play song");
-        self.toggle_play().expect("could not play song");
+
+        if self.cfg.autoplay {
+            self.play();
+        }
 
         loop {
             select! {
@@ -178,16 +220,39 @@ impl JukeBox {
     fn handle_command(&mut self, cmd: Command) -> Result<(), ()> {
         match cmd {
             Command::Next => {
-                self.play_next_song().map_err(|_| ())?;
+                self.prepare_next_song().map_err(|_| ())?;
+                self.play();
             }
             Command::Previous => {
                 self.play_previous_song().map_err(|_| ())?;
+                self.play();
+            }
+            Command::Restart => {
+                // TODO: Currently unloads and reloads the audio file.
+                // Should be able to seek and restart without unloading.
+                let state = self
+                    .stream_state
+                    .as_ref()
+                    .map(|state_lock| *state_lock.lock().unwrap());
+
+                self.prepare_current_song().map_err(|_| ())?;
+                if matches!(state, Some(lib::StreamState::Play)) {
+                    self.play();
+                }
             }
             Command::TogglePlay => {
                 self.toggle_play().map_err(|_| ())?;
             }
             Command::ToggleLoop => {
                 self.queue.set_looping(!self.queue.is_looping());
+            }
+            Command::ToggleAutoplay => {
+                self.cfg.autoplay = !self.cfg.autoplay;
+                tracing::info!("autoplay {:?}", self.cfg.autoplay);
+            }
+            Command::ToggleShowState => {
+                self.cfg.show_state = !self.cfg.show_state;
+                tracing::info!("show state {:?}", self.cfg.show_state);
             }
             Command::Quit => unreachable!("handled elsewhere"),
         }
@@ -197,7 +262,16 @@ impl JukeBox {
 
     fn handle_event(&mut self, event: player_actor::Event) -> Result<(), error::Player> {
         match event {
-            player_actor::Event::Done => self.play_next_song(),
+            player_actor::Event::Done => {
+                if self.cfg.autoplay {
+                    self.prepare_next_song()?;
+                    self.play();
+                    Ok(())
+                } else {
+                    self.prepare_next_song()?;
+                    Ok(())
+                }
+            }
             player_actor::Event::StreamErr(err) => {
                 tracing::error!(?err);
                 Err(error::Player::Stream(err))
@@ -205,9 +279,19 @@ impl JukeBox {
         }
     }
 
-    fn play_next_song(&mut self) -> Result<(), error::Player> {
+    fn prepare_current_song(&mut self) -> Result<(), error::Player> {
+        if let Some(file) = self.queue.current().cloned() {
+            self.load_and_prepare_stream(file.clone())
+        } else {
+            self.pause();
+            tracing::info!("End of playlist");
+            Ok(())
+        }
+    }
+
+    fn prepare_next_song(&mut self) -> Result<(), error::Player> {
         if let Some(file) = self.queue.next().cloned() {
-            self.load_and_play(file.clone())
+            self.load_and_prepare_stream(file.clone())
         } else {
             self.pause();
             tracing::info!("End of playlist");
@@ -217,7 +301,7 @@ impl JukeBox {
 
     fn play_previous_song(&mut self) -> Result<(), error::Player> {
         if let Some(file) = self.queue.next_back().cloned() {
-            self.load_and_play(file)
+            self.load_and_prepare_stream(file)
         } else {
             self.pause();
             tracing::info!("End of playlist");
@@ -229,7 +313,7 @@ impl JukeBox {
     ///
     /// # Returns
     /// + `Err` if the command channel closed.
-    fn load_and_play(&mut self, file: PathBuf) -> Result<(), error::Player> {
+    fn load_and_prepare_stream(&mut self, file: PathBuf) -> Result<(), error::Player> {
         if let Some(state_lock) = self.stream_state.as_ref() {
             *state_lock.lock().unwrap() = lib::StreamState::Stop;
         };
@@ -245,18 +329,76 @@ impl JukeBox {
         tracing::trace!("{file:?} loaded");
 
         let (res_tx, res_rx) = channel::bounded(1);
-        self.command_tx.send(player_actor::Command::Play(res_tx))?;
+        self.command_tx
+            .send(player_actor::Command::Prepare(res_tx))?;
 
         match res_rx.recv()? {
             Ok(stream_state) => {
                 tracing::debug!("{:?}", stream_state.lock().unwrap());
                 let _ = self.stream_state.insert(stream_state);
-                Ok(())
             }
             Err(err) => {
                 tracing::error!(?err);
-                Err(err.into())
+                return Err(err.into());
             }
+        }
+
+        if self.cfg.show_state {
+            let mut stdout = io::stdout();
+            let playlist = self.queue.playlist();
+            let index = self.queue.index();
+            let idx_start = index.checked_sub(self.cfg.playlist_buffer).unwrap_or(0);
+            let idx_end = cmp::min(index + self.cfg.playlist_buffer, playlist.len());
+            for idx in idx_start..=idx_end {
+                if idx == playlist.len() {
+                    write_trace!(stdout, "[END]\n");
+                } else if idx == index && self.cfg.playlist_buffer > 0 {
+                    // highlight current song
+                    write_trace!(stdout, "\x1B[1;7m");
+                    write_trace!(
+                        stdout,
+                        "{:>3}. {}\n",
+                        idx + 1,
+                        playlist[idx].to_string_lossy()
+                    );
+                    write_trace!(stdout, "\x1B[0m");
+                } else {
+                    write_trace!(
+                        stdout,
+                        "{:>3}. {}\n",
+                        idx + 1,
+                        playlist[idx].to_string_lossy()
+                    );
+                }
+            }
+            if idx_end < playlist.len() {
+                write_trace!(stdout, "     (of {} tracks)", playlist.len()); // align with track
+            }
+            write_trace!(stdout, "\n");
+            write_trace!(
+                stdout,
+                "looping: {:?}, autoplay: {:?}\n",
+                self.queue.is_looping(),
+                self.cfg.autoplay,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn play(&mut self) {
+        if let Some(state_lock) = self.stream_state.as_ref() {
+            let mut state = state_lock.lock().unwrap();
+            *state = lib::StreamState::Play;
+            tracing::info!("Playing");
+        }
+    }
+
+    fn pause(&mut self) {
+        if let Some(state_lock) = self.stream_state.as_ref() {
+            let mut state = state_lock.lock().unwrap();
+            *state = lib::StreamState::Pause;
+            tracing::info!("Paused");
         }
     }
 
@@ -275,14 +417,6 @@ impl JukeBox {
         }
 
         Ok(())
-    }
-
-    fn pause(&mut self) {
-        if let Some(state_lock) = self.stream_state.as_ref() {
-            let mut state = state_lock.lock().unwrap();
-            *state = lib::StreamState::Pause;
-            tracing::info!("Paused");
-        }
     }
 }
 

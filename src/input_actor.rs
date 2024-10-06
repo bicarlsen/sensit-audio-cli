@@ -1,3 +1,5 @@
+use crate::{CMD_KEY_RESTART, CMD_KEY_TOGGLE_AUTOPLAY, CMD_KEY_TOGGLE_SHOW_STATE};
+
 use super::{
     Command, CMD_KEY_NEXT, CMD_KEY_PREVIOUS, CMD_KEY_QUIT, CMD_KEY_TOGGLE_LOOP, CMD_KEY_TOGGLE_PLAY,
 };
@@ -39,8 +41,11 @@ fn command_from_str(input: impl AsRef<str>) -> Option<Command> {
         CMD_KEY_QUIT => Some(Command::Quit),
         CMD_KEY_PREVIOUS => Some(Command::Previous),
         CMD_KEY_NEXT => Some(Command::Next),
+        CMD_KEY_RESTART => Some(Command::Restart),
         CMD_KEY_TOGGLE_PLAY => Some(Command::TogglePlay),
         CMD_KEY_TOGGLE_LOOP => Some(Command::ToggleLoop),
+        CMD_KEY_TOGGLE_AUTOPLAY => Some(Command::ToggleAutoplay),
+        CMD_KEY_TOGGLE_SHOW_STATE => Some(Command::ToggleShowState),
         _ => None,
     }
 }
