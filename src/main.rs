@@ -1,18 +1,18 @@
 //! A simple audio player for [Sensit](https://sensit.tech) technical interview.
 //!
 //! # Commands
+//! + `q`: quit
 //! + `p`: play/pause
 //! + `k`: play next track
 //! + `j`: play previous track
+//! + `r`: restart
 //! + `l`: toggle looping
+//! + `a`: toggle autoplay
+//! + `s`: toggle show state
 //!
 //! # References
 //! + https://github.com/dceddia/ffmpeg-cpal-play-audio
 //! + https://www.bekk.christmas/post/2023/19/make-some-noise-with-rust
-//!
-//! # TODOs
-//! + Test on individual large files. Does it take a long time to play first sound?
-//! + Test on large folders. Does it take long to load?
 mod input_actor;
 mod player_actor;
 
