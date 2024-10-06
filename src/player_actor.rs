@@ -18,9 +18,6 @@ pub type PlayResponse = Result<lib::StreamStateLock, error::Play>;
 pub enum Command {
     Load(PathBuf, channel::Sender<LoadResponse>),
     Play(channel::Sender<PlayResponse>),
-
-    /// Close the player
-    Close,
 }
 
 pub struct AudioPlayerActor {
@@ -57,10 +54,6 @@ impl AudioPlayerActor {
                         if let Err(_) = self.handle_play(res_tx) {
                             tracing::error!("response channel closed");
                         }
-                    }
-                    Command::Close => {
-                        tracing::debug!("closing player actor");
-                        break;
                     }
                 }
             } else {

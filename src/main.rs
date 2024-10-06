@@ -1,41 +1,71 @@
 //! # References
 //! + https://github.com/dceddia/ffmpeg-cpal-play-audio
 //! + https://www.bekk.christmas/post/2023/19/make-some-noise-with-rust
+//!
+//! # TODOs
+//! + Test on individual large files. Does it take a long time to play first sound?
+//! + Test on large folders. Does it take long to load?
 mod input_actor;
 mod player_actor;
 
 use cpal::traits::*;
 use crossbeam::{channel, select};
+use device_query::Keycode;
 use ffmpeg_next as ffm;
 use sensit_audio_cli as lib;
 use std::{
-    fs,
+    env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
 const AUDIO_BUFFER_SIZE: usize = 8192;
-const CMD_KEY_PREVIOUS: &str = "j";
-const CMD_KEY_NEXT: &str = "k";
-const CMD_KEY_TOGGLE_PLAY: &str = "p";
+const CMD_KEY_QUIT: Keycode = Keycode::Q;
+const CMD_KEY_PREVIOUS: Keycode = Keycode::J;
+const CMD_KEY_NEXT: Keycode = Keycode::K;
+const CMD_KEY_TOGGLE_PLAY: Keycode = Keycode::P;
 
-pub fn main() {
+pub fn main() -> Result<(), ()> {
     log::enable();
+
+    let mut args = env::args();
+    let program = args.next().expect("program name");
+    let mut args = args.collect::<Vec<String>>();
+    let dir = match args.len() {
+        0 => {
+            tracing::info!("No path provided, using current location.");
+            env::current_dir().expect("can not get current directory")
+        }
+        1 => PathBuf::from(args.remove(0)),
+        _ => {
+            let mut stdout = io::stdout();
+            writeln!(stdout, "{program} use").expect("write to stdout");
+            writeln!(stdout, "{program} <path>").expect("write to stdout");
+            return Err(());
+        }
+    };
+
     ffm::init().expect("could not initialize ffmpeg");
     let (output_device, stream_config) = init_cpal();
     let stream_builder =
         lib::AudioStreamBuilder::new(output_device, stream_config, AUDIO_BUFFER_SIZE);
 
-    run(stream_builder, "samples");
+    run(stream_builder, dir);
+    Ok(())
 }
 
 /// # Arguments
 /// + `dir`: Path to directory containing sound files.
 fn run(stream_builder: lib::AudioStreamBuilder, dir: impl AsRef<Path>) {
     let playlist = create_playlist_from_dir(dir.as_ref());
+    if playlist.is_empty() {
+        tracing::info!("No audio files are present");
+        return;
+    }
     let queue = lib::PlaylistQueue::new(playlist);
 
     let (input_tx, input_rx) = channel::bounded(1);
-    let input_listener = input_actor::InputActor::new(input_tx);
+    let mut input_listener = input_actor::InputActor::new(input_tx);
     let _t_input = std::thread::Builder::new()
         .name("input actor".to_string())
         .spawn(move || input_listener.run())
@@ -82,11 +112,38 @@ impl JukeBox {
     }
 
     fn run(&mut self) {
+        //'load_initial: {
+        //    let file = self.queue.next().expect("queue not empty");
+        //    let (res_tx, res_rx) = channel::bounded(1);
+        //    self.command_tx
+        //        .send(player_actor::Command::Load(file.clone(), res_tx))
+        //        .expect("command channel closed");
+        //
+        //    let Ok(load_res) = res_rx.recv() else {
+        //        tracing::error!("response channel closed");
+        //        break 'load_initial;
+        //    };
+        //
+        //    if let Err(err) = load_res {
+        //        tracing::error!(?err);
+        //    }
+        //    tracing::trace!("{file:?} loaded");
+        //}
+        self.play_next_song()
+            .map_err(|_| ())
+            .expect("could not play song");
+
+        self.toggle_play().expect("could not play song");
+
         loop {
             select! {
                 recv(self.input_rx) -> cmd => match cmd{
                     Ok(cmd) => {
                         tracing::debug!(?cmd);
+                        if matches!(cmd, Command::Quit) {
+                            break;
+                        }
+
                         if let Err(err) = self.handle_command(cmd) {
                             tracing::info!("An error occured");
                             tracing::error!(?err);
@@ -130,6 +187,7 @@ impl JukeBox {
             Command::TogglePlay => {
                 self.toggle_play().map_err(|_| ())?;
             }
+            Command::Quit => unreachable!("handled elsewhere"),
         }
 
         Ok(())
@@ -262,6 +320,7 @@ fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
 
 #[derive(Debug)]
 enum Command {
+    Quit,
     Next,
     Previous,
     TogglePlay,

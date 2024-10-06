@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.89"
 clap = "4.5.18"
 cpal = "0.15.3"
 crossbeam = "0.8.4"
+crossterm = "0.28.1"
 derive_more = { version = "1.0.0", features = ["debug", "deref", "deref_mut"] }
+device_query = "2.1.0"
 ffmpeg-next = "7.1.0"
 ringbuf = "0.4.7"
 thiserror = "1.0.64"
