@@ -1,3 +1,11 @@
+//! A simple audio player for [Sensit](https://sensit.tech) technical interview.
+//!
+//! # Commands
+//! + `p`: play/pause
+//! + `k`: play next track
+//! + `j`: play previous track
+//! + `l`: toggle looping
+//!
 //! # References
 //! + https://github.com/dceddia/ffmpeg-cpal-play-audio
 //! + https://www.bekk.christmas/post/2023/19/make-some-noise-with-rust
@@ -10,7 +18,6 @@ mod player_actor;
 
 use cpal::traits::*;
 use crossbeam::{channel, select};
-use device_query::Keycode;
 use ffmpeg_next as ffm;
 use sensit_audio_cli as lib;
 use std::{
@@ -20,10 +27,20 @@ use std::{
 };
 
 const AUDIO_BUFFER_SIZE: usize = 8192;
-const CMD_KEY_QUIT: Keycode = Keycode::Q;
-const CMD_KEY_PREVIOUS: Keycode = Keycode::J;
-const CMD_KEY_NEXT: Keycode = Keycode::K;
-const CMD_KEY_TOGGLE_PLAY: Keycode = Keycode::P;
+const CMD_KEY_QUIT: &str = "q";
+const CMD_KEY_PREVIOUS: &str = "j";
+const CMD_KEY_NEXT: &str = "k";
+const CMD_KEY_TOGGLE_PLAY: &str = "p";
+const CMD_KEY_TOGGLE_LOOP: &str = "l";
+
+#[derive(Debug)]
+enum Command {
+    Quit,
+    Next,
+    Previous,
+    TogglePlay,
+    ToggleLoop,
+}
 
 pub fn main() -> Result<(), ()> {
     log::enable();
@@ -112,27 +129,9 @@ impl JukeBox {
     }
 
     fn run(&mut self) {
-        //'load_initial: {
-        //    let file = self.queue.next().expect("queue not empty");
-        //    let (res_tx, res_rx) = channel::bounded(1);
-        //    self.command_tx
-        //        .send(player_actor::Command::Load(file.clone(), res_tx))
-        //        .expect("command channel closed");
-        //
-        //    let Ok(load_res) = res_rx.recv() else {
-        //        tracing::error!("response channel closed");
-        //        break 'load_initial;
-        //    };
-        //
-        //    if let Err(err) = load_res {
-        //        tracing::error!(?err);
-        //    }
-        //    tracing::trace!("{file:?} loaded");
-        //}
         self.play_next_song()
             .map_err(|_| ())
             .expect("could not play song");
-
         self.toggle_play().expect("could not play song");
 
         loop {
@@ -187,6 +186,9 @@ impl JukeBox {
             Command::TogglePlay => {
                 self.toggle_play().map_err(|_| ())?;
             }
+            Command::ToggleLoop => {
+                self.queue.set_looping(!self.queue.is_looping());
+            }
             Command::Quit => unreachable!("handled elsewhere"),
         }
 
@@ -207,6 +209,7 @@ impl JukeBox {
         if let Some(file) = self.queue.next().cloned() {
             self.load_and_play(file.clone())
         } else {
+            self.pause();
             tracing::info!("End of playlist");
             Ok(())
         }
@@ -216,6 +219,7 @@ impl JukeBox {
         if let Some(file) = self.queue.next_back().cloned() {
             self.load_and_play(file)
         } else {
+            self.pause();
             tracing::info!("End of playlist");
             Ok(())
         }
@@ -272,6 +276,14 @@ impl JukeBox {
 
         Ok(())
     }
+
+    fn pause(&mut self) {
+        if let Some(state_lock) = self.stream_state.as_ref() {
+            let mut state = state_lock.lock().unwrap();
+            *state = lib::StreamState::Pause;
+            tracing::info!("Paused");
+        }
+    }
 }
 
 /// Creates a playlist from files in a directory.
@@ -316,14 +328,6 @@ fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
         .expect("no supported audio config found");
 
     (device, supported_config_range.with_max_sample_rate())
-}
-
-#[derive(Debug)]
-enum Command {
-    Quit,
-    Next,
-    Previous,
-    TogglePlay,
 }
 
 mod error {

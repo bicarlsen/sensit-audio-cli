@@ -58,14 +58,17 @@ impl PlaylistQueue {
     }
 
     pub fn next(&mut self) -> Option<&PathBuf> {
-        self.current_track += 1;
         if self.cfg.loop_playlist {
+            self.current_track += 1;
             if self.current_track >= self.playlist.len() {
                 self.current_track = 0;
             }
 
             Some(&self.playlist[self.current_track])
         } else {
+            if self.current_track < self.playlist.len() {
+                self.current_track += 1;
+            }
             self.playlist.get(self.current_track)
         }
     }
@@ -82,6 +85,7 @@ impl PlaylistQueue {
             if self.current_track == 0 {
                 None
             } else {
+                self.current_track -= 1;
                 Some(&self.playlist[self.current_track])
             }
         }
@@ -90,13 +94,18 @@ impl PlaylistQueue {
     pub fn to_beginning(&mut self) {
         self.current_track = 0;
     }
+
+    pub fn is_looping(&self) -> bool {
+        self.cfg.loop_playlist
+    }
+
+    pub fn set_looping(&mut self, looping: bool) {
+        self.cfg.loop_playlist = looping;
+    }
 }
 
 #[derive(Debug)]
 pub struct AudioPlayConfig {
-    /// Automatically play next song.
-    pub autoplay: bool,
-
     /// Return to beginning of playlist once ended.
     pub loop_playlist: bool,
 }
@@ -104,7 +113,6 @@ pub struct AudioPlayConfig {
 impl Default for AudioPlayConfig {
     fn default() -> Self {
         Self {
-            autoplay: true,
             loop_playlist: true,
         }
     }
